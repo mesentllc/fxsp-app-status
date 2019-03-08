@@ -1,8 +1,11 @@
 package com.fedex.smartpost.utilities;
 
+import com.fedex.smartpost.utilities.common.CommonUtils;
+import com.fedex.smartpost.utilities.service.CommandService;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -12,9 +15,14 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
+import java.util.HashMap;
+import java.util.Map;
 
+@SpringBootApplication
 public class AppStatus {
 	private static final Log logger = LogFactory.getLog(AppStatus.class);
+	private static Map<String, String> arguments = new HashMap<>();
+	private static CommandService commandService = new CommandService();
 	private static BufferedWriter bw;
 
 	public static void main(String[] args) throws IOException {
@@ -27,36 +35,131 @@ public class AppStatus {
 			return;
 		}
 		bw = new BufferedWriter(new FileWriter(String.format("appStatus-%s.txt", sdf.format(calendar.getTimeInMillis()))));
-		appStatus.process(args[0]);
+		appStatus.retrieveArguments(args);
+		appStatus.process();
 		bw.close();
 	}
 
-	private void process(String root) throws IOException {
-		File rootDir = new File(root);
-		File[] files;
+	private void retrieveArguments(String[] args) {
+		if (args == null) {
+			return;
+		}
+		for (int ptr = 0, maxPtr = args.length; ptr < maxPtr; ptr++) {
+			switch (args[ptr].toLowerCase()) {
+				case "-c":
+					arguments.put("compile", "yes");
+					break;
+				case "-r":
+					arguments.put("recurse", "yes");
+					break;
+				case "-spath":
+					arguments.put("spath", args[++ptr]);
+					break;
+				case "-opath":
+					arguments.put("opath", args[++ptr]);
+					break;
+				case "-dcpath":
+					arguments.put("dcpath", args[++ptr]);
+					break;
+				case "-h":
+					arguments.put("help", "true");
+			}
+		}
+		if (arguments.containsKey("help")) {
+			printHelp();
+			System.exit(0);
+		}
+		if (!arguments.containsKey("dcpath")) {
+			throw new RuntimeException("Required path to dependency-check (-dcpath argument) missing.  Use -h to display help.");
+		}
+		if (arguments.containsKey("opath")) {
+			File file = new File(arguments.get("opath"));
+			file.mkdirs();
+		}
+	}
 
+	private void printHelp() {
+		StringBuilder sb = new StringBuilder();
+		sb.append("Usage: fxsp-app-status [switches]").append("\n\n")
+		  .append("Switches:").append("\n")
+		  .append("\t-c\t\t- Compile the application first, before running dependency-check").append("\n")
+		  .append("\t-h\t\t- Print this help page").append("\n")
+		  .append("\t-r\t\t- Recurse through all the directories of applications designated by the spath switch").append("\n")
+		  .append("\t-dcpath <path>\t- [REQUIRED] - Path to the OWASP dependency-check.bat file").append("\n")
+		  .append("\t-opath <path>\t- Path to put the analysis reports, if not set, it will put the report in the application's root folder").append("\n")
+		  .append("\t-spath <path>\t- Path to the source files (for compile) and/or JAR files if just analyzing [DEFAULT: current directory]").append("\n\n");
+
+		System.out.println(sb.toString());
+	}
+
+	private void process() throws IOException {
+		String root = ".";
+
+		if (arguments.containsKey("spath")) {
+			root = arguments.get("spath");
+		}
+		File rootDir = new File(root);
 		if (!rootDir.isDirectory()) {
 			throw new RuntimeException(root + " is not a directory -- can't search on a file.");
 		}
-		else {
-			files = rootDir.listFiles();
-			if (foundProjectRoot(files)) {
-				checkProjectRoot(rootDir);
+		if (arguments.containsKey("recurse")) {
+			File[] files = rootDir.listFiles();
+			if (!CommonUtils.foundProjectRoot(files)) {
+				processDirectories(files);
+				return;
 			}
 		}
-		iterateOver(files, null);
+		processPath(rootDir);
 	}
 
-	private boolean foundProjectRoot(File[] files) {
-		boolean pomFound = false;
+	private void processPath(File rootDir) throws IOException {
+		File[] files = rootDir.listFiles();
+		if (CommonUtils.foundProjectRoot(files)) {
+			checkProjectRoot(rootDir);
+			iterateOver(files, null);
+			compileIfAsked(rootDir);
+			performOwasp(rootDir);
+		}
+	}
+
+	private void processDirectories(File[] files) throws IOException {
+		if (files == null) {
+			return;
+		}
 		for (File file : files) {
-			String filename = file.getName();
-			if (filename.equals("pom.xml") || filename.equals("build.gradle")) {
-				pomFound = true;
-				break;
+			if (file.isDirectory()) {
+				processPath(file);
 			}
 		}
-		return pomFound;
+	}
+
+	private void compileIfAsked(File rootDir) throws IOException {
+		if (arguments.containsKey("compile")) {
+			switch (CommonUtils.getProjectType(rootDir)) {
+				case "maven":
+					commandService.mvnCompile(rootDir);
+					break;
+				case "gradle":
+					commandService.gradleCompile(rootDir);
+			}
+		}
+	}
+
+	private void performOwasp(File rootDir) throws IOException {
+		String dcCommand = arguments.get("dcpath");
+		if (!dcCommand.contains("\\bin")) {
+			if (!dcCommand.endsWith("\\")) {
+				dcCommand += "\\";
+			}
+			dcCommand += "bin\\dependency-check.bat";
+		}
+		if (!dcCommand.endsWith("dependency-check.bat")) {
+			if (!dcCommand.endsWith("\\")) {
+				dcCommand += "\\";
+			}
+			dcCommand += "dependency-check.bat";
+		}
+		commandService.checkOwasp(dcCommand, rootDir, arguments.get("opath"));
 	}
 
 	private void checkProjectRoot(File rootDir) throws IOException {
@@ -209,21 +312,24 @@ public class AppStatus {
 		}
 		for (File file : files) {
 			if (file.isDirectory()) {
-				File[] directoryFiles = file.listFiles();
-				if (directoryFiles != null && foundProjectRoot(directoryFiles)) {
-					checkProjectRoot(file);
-				}
-				String filename = file.getAbsolutePath();
-				filename = filename.substring(filename.lastIndexOf("\\") + 1);
-				if (!filename.equals(rootPath)) {
-					if (resetRoot) {
-						iterateOver(directoryFiles, filename);
-					}
-					else {
-						if (filename.contains(rootPath)) {
-							iterateOver(directoryFiles, rootPath);
-						}
-					}
+				logDependencies(rootPath, resetRoot, file);
+			}
+		}
+	}
+
+	private void logDependencies(String rootPath, boolean resetRoot, File file) throws IOException {
+		File[] directoryFiles = file.listFiles();
+		if (directoryFiles != null && CommonUtils.foundProjectRoot(directoryFiles)) {
+			checkProjectRoot(file);
+		}
+		String filename = CommonUtils.getFilename(file);
+		if (!filename.equals(rootPath)) {
+			if (resetRoot) {
+				iterateOver(directoryFiles, filename);
+			}
+			else {
+				if (filename.contains(rootPath)) {
+					iterateOver(directoryFiles, rootPath);
 				}
 			}
 		}
